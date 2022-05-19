@@ -2,6 +2,7 @@
 layout: post
 title:  "Integral Literature on DevOps"
 date:   2022-05-18 19:06:08 +0000
+parent: Blog
 categories: mindset
 ---
 When time permits, I like to read books and papers on our industry and I think to understand most of the ideas that drive it forward are very well described within the books presented below.
