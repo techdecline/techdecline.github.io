@@ -27,7 +27,7 @@ Authorization means to allow a given entity to access certain resources. In the 
 
 To do this, we must allow the exact Build Service Account to read project information and git repositories on the Library project. Below, you will find a working Terraform Snippet to set that up.
 
-``
+```terraform
 locals {
   azdo_org_name = regex("<https://dev.azure.com/(.*)/>$", data.azuredevops_client_config.cfg_azdo.organization_url)[0]
 }
@@ -95,7 +95,7 @@ resource "azuredevops_group_membership" "gm_azdo_infra_read" {
     each.value.descriptor
   ]
 }
-``
+```
 
 What's happening here is the following:
 
@@ -108,10 +108,90 @@ This will effectively allow the pipeline to access all repositories from the Lib
 
 ## Authentication
 
+When the pipeline is executed and the code is checked out from the remote repository the build agent must authenticate against the remote. This can be achieved using either OAuth methods or a Token in the context of Azure Repos. As stated, we're going to use the Access Token from the pipeline that we need to inject into all git operations somehow. To do so, I tested some approaches (I guess there are a couple more that I could not come up with).
+
 ### HTTP Extraheader
+
+Reading the [Official Git Documentation](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpextraHeader), you'll find a method that allows git to add additional HTTP Headers into git operations. This seems to be the correct approach for our example and is also documented extensively within [Microsoft Docs](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows#use-a-pat).
+
+Setting this up in a YAML pipeline is relatively easy as show below:
+
+```YAML
+- bash: |
+          git config --global http.https://dev.azure.com/<organization>/Library/_git/composite-configuration.extraheader "AUTHORIZATION: bearer $(System.AccessToken)"
+        displayName: 'Set Accesstoken in git extraheader'
+```
+
+Unfortunately, this solution does not scale well as the header needs to be modified for every git link throughout the configuration. Therefore, it was neglected for the given task.
 
 ### Inject PAT into Git Links using Regex
 
+Going foward, I stumbled upon an idea to just do some regex-magic on the git links within the Terragrunt.hcl file(s) to replace all links with another one containing the Access token as shown in the snippet below.
+
+```YAML
+- bash: |
+    find $(Build.SourcesDirectory)/ -type f \( -name 'terragrunt.hcl'\) -exec sed -i 's~git::https://dev.azure.com~git::https://$(System.AccessToken)@dev.azure.com~g' {} \;
+  displayName: "Inject System Access Token into Git links"
+```
+
+This works great as long as there are no further git links within the Terraform configuration downloaded. As this is not the case for our given case, this method was neglected as well.
+
 ### Git Credential Manager Core
 
-## Additional Links and references
+[GCM Core](https://github.com/GitCredentialManager/git-credential-manager) is a Git Credential Manager implemented in .net Core that allows for unified Credential Management for git for all computing platforms (Windows, Linux, macOS).
+
+For the given task, GCM has been added to the Built Agents Docker image by adding the following snippet into the Dockerfile.
+
+```Dockerfile
+# Install Git Credential Manager Core
+RUN curl -LO https://raw.githubusercontent.com/GitCredentialManager/git-credential-manager/main/src/linux/Packaging.Linux/install-from-source.sh && \
+    echo y | sh ./install-from-source.sh && \
+    git-credential-manager-core configure
+```
+
+Even though, GCM Core supports various secure mechanisms to store credentials, it was decided to work with plaintext credentials as those are only stored as long as the pipeline runs where the token is readable anyways.
+
+To store the credentials beforehand, a [PowerShell script](https://gist.github.com/techdecline/24ebc99a0fa4d25b6c8527ac8414412b) has been created that composes a working Git Credential file.
+
+```Powershell
+param (
+    [String]$OrganizationName = $($Env:SYSTEM_COLLECTIONURI -replace ".$") ,
+    [String]$UserName = "serviceuser@organization.com", # this is just a dummy value
+    [String]$PAT = $Env:SYSTEM_ACCESSTOKEN,
+    [String]$StorePath = $PWD
+)
+
+# git config
+. git config --global credential.interactive false
+. git config --global credential.credentialStore plaintext
+. git config --global credential.plaintextStorePath $StorePath
+. git config --global credential.azreposCredentialType pat
+
+$sb = [System.Text.StringBuilder]::new()
+[void]$sb.AppendLine( $PAT )
+[void]$sb.AppendLine( "service=$OrganizationName" )
+[void]$sb.AppendLine( "account=$UserName" )
+
+$gcmPlaintextPath = Join-Path -Path $StorePath -ChildPath "git/https/dev.azure.com/$(($OrganizationName -split "/")[-1])/$UserName.credential"
+$null = New-Item $gcmPlaintextPath -Force
+$null = Set-Content -Path $gcmPlaintextPath -Value $sb.ToString()
+```
+
+Within the pipeline the script gets called with predefined variables as parameters.
+
+```YAML
+- powershell: |
+    . ./scripts/New-GcmPlainTextGitConfig.ps1
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+  displayName: "Setup Git Credential Manager Core with Plaintext Credentials for Azure DevOps"
+```
+
+This way all git links derived from the Azure DevOps organization will use the pipeline's access token without additional configuration. Additionally, the solution could theoretically be extended to store additional credentials for other organizations and utilize [encrypted methods](https://github.com/GitCredentialManager/git-credential-manager/blob/main/docs/credstores.md) for storing credentials.
+
+## Verdict
+
+In case your configuration is stored in single repository, using the HTTP extraheader is the go-to option thereas using the regex-method yields best results when your configuration is stored in repositories that do not contain additional remote calls.
+
+Using Git Credential Manager Core gives you the highest amount of flexibility for the cost of updating your deployment image beforehand.
